@@ -389,7 +389,10 @@ func TestRateOutputNoteMigration(t *testing.T) {
 	if err := json.Unmarshal(newJSON, &legacy); err != nil {
 		t.Fatalf("old client unmarshal new output: %v", err)
 	}
-	if legacy.Base != "USD" || legacy.Target != "UAH" || legacy.Rate != 41.5 {
+	if legacy.Base != "USD" ||
+		legacy.Target != "UAH" ||
+		legacy.Rate != 41.5 ||
+		legacy.AsOf != "2026-07-29" {
 		t.Errorf("legacy output = %+v, want original rate fields", legacy)
 	}
 }
