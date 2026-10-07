@@ -71,6 +71,7 @@ type RateOutput struct {
 	Target   string         `json:"target" jsonschema:"Normalized ISO 4217 target currency code"`
 	Rate     float64        `json:"rate" jsonschema:"How many units of target one unit of base buys"`
 	AsOf     string         `json:"as_of" jsonschema:"Rate date in YYYY-MM-DD format"`
+	Note     string         `json:"note,omitempty" jsonschema:"Optional human-readable note about the result"`
 	Evidence []RateSnapshot `json:"evidence" jsonschema:"Rate snapshots that support this result"`
 }
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -344,4 +345,51 @@ type stubNamed struct {
 func (s *stubNamed) Name() string { return s.name }
 func (s *stubNamed) RatesToUAH(context.Context) (map[string]float64, string, error) {
 	return s.rates, s.date, nil
+}
+
+func TestRateOutputNoteMigration(t *testing.T) {
+	oldJSON := []byte(`{
+		"base":"USD",
+		"target":"UAH",
+		"rate":41.5,
+		"as_of":"2026-07-29",
+		"evidence":[]
+	}`)
+
+	var current RateOutput
+	if err := json.Unmarshal(oldJSON, &current); err != nil {
+		t.Fatalf("unmarshal old output: %v", err)
+	}
+	if current.Note != "" {
+		t.Errorf("Note = %q, want empty string for old output", current.Note)
+	}
+
+	reencoded, err := json.Marshal(current)
+	if err != nil {
+		t.Fatalf("marshal output without note: %v", err)
+	}
+	if strings.Contains(string(reencoded), `"note"`) {
+		t.Errorf("output without a note must omit note: %s", reencoded)
+	}
+
+	current.Note = "Rate uses the offline fixture."
+	newJSON, err := json.Marshal(current)
+	if err != nil {
+		t.Fatalf("marshal output with note: %v", err)
+	}
+
+	type rateOutputV1 struct {
+		Base   string  `json:"base"`
+		Target string  `json:"target"`
+		Rate   float64 `json:"rate"`
+		AsOf   string  `json:"as_of"`
+	}
+
+	var legacy rateOutputV1
+	if err := json.Unmarshal(newJSON, &legacy); err != nil {
+		t.Fatalf("old client unmarshal new output: %v", err)
+	}
+	if legacy.Base != "USD" || legacy.Target != "UAH" || legacy.Rate != 41.5 {
+		t.Errorf("legacy output = %+v, want original rate fields", legacy)
+	}
 }
