@@ -47,17 +47,31 @@ type RateInput struct {
 	Target string `json:"target" jsonschema:"ISO 4217 code of the target currency, e.g. UAH"`
 }
 
-// RateOutput is the tool's output contract.
-//
-// Source is deliberately included: an agent answer that cannot say where a
-// number came from is not auditable, and provenance is a week 3 theme that
-// starts here.
+type SourceKind string
+
+const (
+	SourceKindAPI   SourceKind = "api"
+	SourceKindCache SourceKind = "cache"
+	SourceKindMock  SourceKind = "mock"
+)
+
+type Source struct {
+	Kind     SourceKind `json:"kind" jsonschema:"Origin category: api, cache, or mock"`
+	Provider string     `json:"provider" jsonschema:"Name of the provider that returned the rate"`
+}
+
+type RateSnapshot struct {
+	Rate   float64 `json:"rate" jsonschema:"Exchange rate for this snapshot"`
+	AsOf   string  `json:"as_of" jsonschema:"Rate date in YYYY-MM-DD format"`
+	Source Source  `json:"source" jsonschema:"Provenance of this rate snapshot"`
+}
+
 type RateOutput struct {
-	Base   string  `json:"base"`
-	Target string  `json:"target"`
-	Rate   float64 `json:"rate" jsonschema:"How many units of target one unit of base buys"`
-	AsOf   string  `json:"as_of" jsonschema:"Rate date, YYYY-MM-DD"`
-	Source string  `json:"source" jsonschema:"Provenance of the rate, e.g. nbu or fixture"`
+	Base     string         `json:"base" jsonschema:"Normalized ISO 4217 base currency code"`
+	Target   string         `json:"target" jsonschema:"Normalized ISO 4217 target currency code"`
+	Rate     float64        `json:"rate" jsonschema:"How many units of target one unit of base buys"`
+	AsOf     string         `json:"as_of" jsonschema:"Rate date in YYYY-MM-DD format"`
+	Evidence []RateSnapshot `json:"evidence" jsonschema:"Rate snapshots that support this result"`
 }
 
 // Provider fetches rates against UAH, which is the axis the National Bank of
@@ -71,6 +85,18 @@ type Provider interface {
 	// RatesToUAH returns how many UAH one unit of each listed currency buys,
 	// plus the date the rates are valid for.
 	RatesToUAH(ctx context.Context) (map[string]float64, string, error)
+}
+
+func sourceForProvider(p Provider) Source {
+	kind := SourceKindAPI
+	if p.Name() == "fixture" {
+		kind = SourceKindMock
+	}
+
+	return Source{
+		Kind:     kind,
+		Provider: p.Name(),
+	}
 }
 
 // normalizeCode upper-cases and validates a currency code.
@@ -115,12 +141,21 @@ func Convert(ctx context.Context, p Provider, in RateInput) (RateOutput, error) 
 		return RateOutput{}, err
 	}
 
+	rate := baseUAH / targetUAH
+	source := sourceForProvider(p)
+
 	return RateOutput{
 		Base:   base,
 		Target: target,
-		Rate:   baseUAH / targetUAH,
+		Rate:   rate,
 		AsOf:   asOf,
-		Source: p.Name(),
+		Evidence: []RateSnapshot{
+			{
+				Rate:   rate,
+				AsOf:   asOf,
+				Source: source,
+			},
+		},
 	}, nil
 }
 

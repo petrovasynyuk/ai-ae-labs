@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -41,8 +42,16 @@ func TestConvert(t *testing.T) {
 			if got.AsOf != "2026-07-29" {
 				t.Errorf("AsOf = %q, want %q", got.AsOf, "2026-07-29")
 			}
-			if got.Source == "" {
-				t.Error("Source is empty; provenance must always be populated")
+			if len(got.Evidence) != 1 {
+				t.Fatalf("Evidence length = %d, want 1", len(got.Evidence))
+			}
+
+			snapshot := got.Evidence[0]
+			if snapshot.Source.Kind != SourceKindMock {
+				t.Errorf("Source.Kind = %q, want %q", snapshot.Source.Kind, SourceKindMock)
+			}
+			if snapshot.Source.Provider != "fixture" {
+				t.Errorf("Source.Provider = %q, want fixture", snapshot.Source.Provider)
 			}
 		})
 	}
@@ -58,16 +67,18 @@ func closeEnough(got, want float64) bool {
 
 func TestConvertErrors(t *testing.T) {
 	tests := []struct {
-		name string
-		in   RateInput
-		want error
+		name     string
+		in       RateInput
+		want     error
+		wantText string
 	}{
-		{name: "unknown base", in: RateInput{Base: "XYZ", Target: "UAH"}, want: ErrUnknownCurrency},
-		{name: "unknown target", in: RateInput{Base: "USD", Target: "XYZ"}, want: ErrUnknownCurrency},
-		{name: "empty base", in: RateInput{Base: "", Target: "UAH"}, want: ErrInvalidCode},
-		{name: "too short", in: RateInput{Base: "US", Target: "UAH"}, want: ErrInvalidCode},
-		{name: "too long", in: RateInput{Base: "USDD", Target: "UAH"}, want: ErrInvalidCode},
-		{name: "digits rejected", in: RateInput{Base: "US1", Target: "UAH"}, want: ErrInvalidCode},
+		{name: "unknown base", in: RateInput{Base: "XYZ", Target: "UAH"}, want: ErrUnknownCurrency, wantText: "XYZ"},
+		{name: "unknown target", in: RateInput{Base: "USD", Target: "XYZ"}, want: ErrUnknownCurrency, wantText: "XYZ"},
+		{name: "empty base", in: RateInput{Base: "", Target: "UAH"}, want: ErrInvalidCode, wantText: `""`},
+		{name: "too short", in: RateInput{Base: "US", Target: "UAH"}, want: ErrInvalidCode, wantText: "US"},
+		{name: "too long", in: RateInput{Base: "USDD", Target: "UAH"}, want: ErrInvalidCode, wantText: "USDD"},
+		{name: "digits rejected", in: RateInput{Base: "US1", Target: "UAH"}, want: ErrInvalidCode, wantText: "US1"},
+		{name: "invalid target", in: RateInput{Base: "USD", Target: "US1"}, want: ErrInvalidCode, wantText: "US1"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -77,20 +88,11 @@ func TestConvertErrors(t *testing.T) {
 			}
 			// The message is what the model sees. It must name the offending
 			// value, or the model cannot correct its own call.
-			if err != nil && tc.in.Base != "" && !contains(err.Error(), "USD", "XYZ", "US", "USDD", "US1") {
-				t.Errorf("error %q names no offending value", err)
+			if !strings.Contains(err.Error(), tc.wantText) {
+				t.Errorf("error = %q, want it to contain %q", err, tc.wantText)
 			}
 		})
 	}
-}
-
-func contains(s string, subs ...string) bool {
-	for _, sub := range subs {
-		if sub != "" && len(s) >= len(sub) && indexOf(s, sub) >= 0 {
-			return true
-		}
-	}
-	return false
 }
 
 func indexOf(s, sub string) int {
@@ -320,11 +322,15 @@ func TestConvertMonobankPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Convert() error = %v", err)
 	}
-	if got.Source != "monobank" {
-		t.Errorf("Source = %q, want monobank", got.Source)
+	if len(got.Evidence) != 1 {
+		t.Fatalf("Evidence length = %d, want 1", len(got.Evidence))
 	}
-	if got.Source == "nbu" {
-		t.Error("NBU provenance must not leak into a monobank answer")
+	snapshot := got.Evidence[0]
+	if snapshot.Source.Provider != "monobank" {
+		t.Errorf("Source.Provider = %q, want monobank", snapshot.Source.Provider)
+	}
+	if snapshot.Source.Kind != SourceKindAPI {
+		t.Errorf("Source.Kind = %q, want %q", snapshot.Source.Kind, SourceKindAPI)
 	}
 }
 
