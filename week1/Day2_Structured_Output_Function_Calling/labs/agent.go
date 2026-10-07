@@ -22,8 +22,9 @@ func NewRateTool(p Provider) (tool.Tool, error) {
 	}
 	t, err := functiontool.New(functiontool.Config{
 		Name: "get_exchange_rate",
-		Description: "Returns the exchange rate between two ISO 4217 currencies, " +
-			"cross-rated through UAH using National Bank of Ukraine data.",
+		Description: "Returns a typed exchange rate between two ISO 4217 currencies. " +
+			"Use it for each currency conversion request. The result includes the rate date " +
+			"and structured provenance. It cross-rates through UAH using the configured provider.",
 	}, handler)
 	if err != nil {
 		return nil, fmt.Errorf("build rate tool: %w", err)
