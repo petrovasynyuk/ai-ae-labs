@@ -1,8 +1,12 @@
 package main
 
 import (
+	"errors"
 	"strings"
 	"testing"
+
+	"google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/workflow"
 
 	"github.com/dimetron/ai-eng-course/labs/internal/labrun"
 	"github.com/dimetron/ai-eng-course/labs/week2/internal/refund"
@@ -150,4 +154,106 @@ func deltaCarries(res labrun.Result, key, want string) bool {
 		}
 	}
 	return false
+}
+
+type nodeTestContext struct {
+	agent.StrictContextMock
+}
+
+func (c *nodeTestContext) InvocationID() string { return "inv-test-1" }
+
+func TestFunctionNodeWithSchemaEarlyRejection(t *testing.T) {
+	schema := formatInputSchema()
+
+	var calls int
+	body := func(ctx agent.Context, in refund.Output) (string, error) {
+		calls++
+		return refund.Format(ctx, in)
+	}
+
+	node, err := workflow.NewFunctionNodeWithSchema[refund.Output, string](
+		"format", body, schema, nil, workflow.NodeConfig{},
+	)
+	if err != nil {
+		t.Fatalf("NewFunctionNodeWithSchema = %v, want nil", err)
+	}
+
+	ctx := &nodeTestContext{StrictContextMock: agent.NewStrictContextMock(t.Context())}
+
+	// 1. Positive case: valid input executes body and increments calls counter to 1.
+	t.Run("valid input executes body and increments calls counter to 1", func(t *testing.T) {
+		calls = 0
+		valid := refund.Output{
+			CaseID:        "rc-txn-123-A-114",
+			TransactionID: "txn-123",
+			MerchantID:    "A-114",
+			Status:        "pending",
+		}
+		for _, runErr := range node.Run(ctx, valid) {
+			if runErr != nil {
+				t.Fatalf("valid input produced error: %v", runErr)
+			}
+		}
+		if calls != 1 {
+			t.Fatalf("calls = %d, want 1", calls)
+		}
+	})
+
+	// 2. Negative cases: invalid inputs rejected by schema validation before body execution (calls == 0).
+	for _, tc := range []struct {
+		name  string
+		input any
+	}{
+		{"empty case_id (violates minLength)", refund.Output{
+			CaseID:        "",
+			TransactionID: "txn-123",
+			MerchantID:    "A-114",
+			Status:        "pending",
+		}},
+		{"missing fields in payload", map[string]any{
+			"case_id": "rc-txn-123-A-114",
+		}},
+		{"wrong type for case_id", map[string]any{
+			"case_id":        12345,
+			"transaction_id": "txn-123",
+			"merchant_id":    "A-114",
+			"status":         "pending",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls = 0
+			var errFound error
+			for _, runErr := range node.Run(ctx, tc.input) {
+				if runErr != nil {
+					errFound = runErr
+					break
+				}
+			}
+			if errFound == nil {
+				t.Fatalf("expected schema validation error for %s", tc.name)
+			}
+			if !strings.Contains(errFound.Error(), "validat") && !errors.Is(errFound, workflow.ErrInputValidation) {
+				t.Fatalf("expected input validation error for %s, got: %v", tc.name, errFound)
+			}
+			if calls != 0 {
+				t.Fatalf("calls = %d, want 0 (body must not be called): %s", calls, tc.name)
+			}
+		})
+	}
+}
+
+func TestFormatNodeInGraphSchema(t *testing.T) {
+	s := formatInputSchema()
+	if s == nil || s.Type != "object" {
+		t.Fatalf("formatInputSchema returned invalid schema: %+v", s)
+	}
+	if len(s.Required) != 4 {
+		t.Fatalf("expected 4 required fields, got %v", s.Required)
+	}
+	for _, prop := range []string{"case_id", "transaction_id", "merchant_id", "status"} {
+		p, ok := s.Properties[prop]
+		if !ok || p == nil || p.MinLength == nil || *p.MinLength != 1 {
+			t.Fatalf("expected minLength=1 for %s, got %+v", prop, p)
+		}
+	}
 }

@@ -5,6 +5,7 @@ import (
 	"log"
 	"strings"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/workflowagent"
 	"google.golang.org/adk/v2/model"
@@ -55,11 +56,16 @@ func newGraph(reg *refund.Registry) (agent.Agent, error) {
 		classify = workflow.NewEmittingFunctionNode("classify", classifyRouteText, cfg)
 	}
 	prepare := workflow.NewFunctionNode("prepare", refund.Prepare, cfg)
-	openCase, err := workflow.NewToolNodeTyped[refund.Input, refund.Output](refundTool, cfg)
+	openCase, err := workflow.NewToolNodeWithSchemas(refundTool, nil, formatInputSchema(), cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create refund node: %w", err)
 	}
-	format := workflow.NewFunctionNode("format", refund.Format, cfg)
+	format, err := workflow.NewFunctionNodeWithSchema[refund.Output, string](
+		"format", refund.Format, formatInputSchema(), nil, cfg,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create format node: %w", err)
+	}
 	prepareStatus := workflow.NewFunctionNode("prepare_status", refund.PrepareStatus, cfg)
 	checkStatus, err := workflow.NewToolNodeTyped[refund.StatusInput, refund.Output](statusTool, cfg)
 	if err != nil {
@@ -193,4 +199,20 @@ func classifyWithModel(ctx agent.Context, c refund.Classifier, msg string) (stri
 	// domain, which is a branch that exists. Never return "": no route at all
 	// would leave classify's edges with nothing to match.
 	return refund.RouteOutOfDomain, nil
+}
+
+// formatInputSchema defines the validation contract for the format node input (refund.Output).
+// It verifies that CaseID, TransactionID, MerchantID, and Status are present and non-empty string fields.
+func formatInputSchema() *jsonschema.Schema {
+	minLen := 1
+	return &jsonschema.Schema{
+		Type: "object",
+		Properties: map[string]*jsonschema.Schema{
+			"case_id":        {Type: "string", MinLength: &minLen},
+			"transaction_id": {Type: "string", MinLength: &minLen},
+			"merchant_id":    {Type: "string", MinLength: &minLen},
+			"status":         {Type: "string", MinLength: &minLen},
+		},
+		Required: []string{"case_id", "transaction_id", "merchant_id", "status"},
+	}
 }
