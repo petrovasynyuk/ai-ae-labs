@@ -56,12 +56,23 @@ func newGraph(reg *refund.Registry) (agent.Agent, error) {
 		classify = workflow.NewEmittingFunctionNode("classify", classifyRouteText, cfg)
 	}
 	prepare := workflow.NewFunctionNode("prepare", refund.Prepare, cfg)
-	openCase, err := workflow.NewToolNodeWithSchemas(refundTool, nil, formatInputSchema(), cfg)
+	openCase, err := workflow.NewToolNodeTyped[refund.Input, refund.Output](refundTool, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create refund node: %w", err)
 	}
+	formatSchema := formatInputSchema()
+	outputSchema, err := formatSchema.Resolve(nil)
+	if err != nil {
+		return nil, fmt.Errorf("resolve refund output schema: %w", err)
+	}
+	// ADK requires equal schemas on both ends of an edge. Refine the typed
+	// tool's output contract through its public BaseNode, keeping its inferred
+	// input schema, identity and configuration unchanged.
+	openCase.BaseNode = workflow.NewBaseNodeWithSchemas(
+		openCase.Name(), openCase.Description(), openCase.Config(), openCase.InputSchema(), outputSchema,
+	)
 	format, err := workflow.NewFunctionNodeWithSchema[refund.Output, string](
-		"format", refund.Format, formatInputSchema(), nil, cfg,
+		"format", refund.Format, formatSchema, nil, cfg,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create format node: %w", err)
