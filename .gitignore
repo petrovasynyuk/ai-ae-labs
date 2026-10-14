@@ -39,3 +39,5 @@ demo/agui_web/agui_web
 
 # macOS/VS Code droppings.
 .DS_Store
+
+.idea/
