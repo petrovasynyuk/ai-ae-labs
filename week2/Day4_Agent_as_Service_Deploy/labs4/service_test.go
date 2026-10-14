@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -32,8 +33,20 @@ func request(t *testing.T, client *http.Client, method, url, body string) (int, 
 	return resp.StatusCode, resp.Header, string(data)
 }
 
-const sessionPath = "/api/apps/first_graph_agent/users/learner/sessions/demo"
-const runBody = `{"appName":"first_graph_agent","userId":"learner","sessionId":"demo","newMessage":{"role":"user","parts":[{"text":"txn-2026-07-118845 A-114"}]}}`
+func makeRunBody(appName, userID, sessionID, message string) string {
+	return fmt.Sprintf(`{"appName":%q,"userId":%q,"sessionId":%q,"newMessage":{"role":"user","parts":[{"text":%q}]}}`,
+		appName, userID, sessionID, message)
+}
+
+func createSession(t *testing.T, client *http.Client, serverURL, appName, userID, sessionID string) string {
+	t.Helper()
+	path := fmt.Sprintf("/api/apps/%s/users/%s/sessions/%s", appName, userID, sessionID)
+	status, _, body := request(t, client, "POST", serverURL+path, "{}")
+	if status != http.StatusOK {
+		t.Fatalf("create session %s: %d %s", sessionID, status, body)
+	}
+	return path
+}
 
 func TestADKServiceWithoutKey(t *testing.T) {
 	t.Setenv("GOOGLE_API_KEY", "")
@@ -43,6 +56,13 @@ func TestADKServiceWithoutKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkADKService(t, svc)
+}
+
+func TestNewGraphNilRegistry(t *testing.T) {
+	_, err := newGraph(nil)
+	if err == nil {
+		t.Fatal("expected error for nil registry, got nil")
+	}
 }
 
 func TestListenAddress(t *testing.T) {
@@ -56,6 +76,64 @@ func TestListenAddress(t *testing.T) {
 		if got != tc.want || (err != nil) != (tc.want == "") {
 			t.Fatalf("listenAddress(%q) = %q, %v", tc.port, got, err)
 		}
+	}
+}
+
+func TestValidatePprofAddr(t *testing.T) {
+	for _, tc := range []struct {
+		addr    string
+		wantErr bool
+	}{
+		{"", false},
+		{"127.0.0.1:6060", false},
+		{"127.0.0.1:0", false},
+		{"0.0.0.0:6060", true},
+		{"192.168.1.10:6060", true},
+		{"localhost:6060", true},
+		{"invalid", true},
+		{"127.0.0.1:99999", true},
+	} {
+		err := validatePprofAddr(tc.addr)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("validatePprofAddr(%q) error = %v, wantErr = %v", tc.addr, err, tc.wantErr)
+		}
+	}
+}
+
+func TestPprofServerIsolated(t *testing.T) {
+	server, listener, err := newPprofServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("newPprofServer: %v", err)
+	}
+	defer listener.Close()
+	go func() { _ = server.Serve(listener) }()
+	defer func() { _ = server.Close() }()
+
+	pprofURL := "http://" + listener.Addr().String()
+	resp, err := http.Get(pprofURL + "/debug/pprof/")
+	if err != nil {
+		t.Fatalf("GET pprof index: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET pprof index status = %d, want 200", resp.StatusCode)
+	}
+
+	// Verify main service does NOT mount /debug/pprof/
+	svc, err := newService()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainServer := httptest.NewServer(svc)
+	defer mainServer.Close()
+
+	respMain, err := http.Get(mainServer.URL + "/debug/pprof/")
+	if err != nil {
+		t.Fatalf("GET main server pprof: %v", err)
+	}
+	defer respMain.Body.Close()
+	if respMain.StatusCode != http.StatusNotFound {
+		t.Fatalf("main server mounted pprof: status = %d, want 404", respMain.StatusCode)
 	}
 }
 
@@ -170,58 +248,150 @@ func checkADKService(t *testing.T, svc *service) {
 	t.Helper()
 	server := httptest.NewServer(svc)
 	defer server.Close()
+
+	// Initial health & readiness checks
 	for _, path := range []string{"/health", "/readyz"} {
 		status, _, body := request(t, server.Client(), "GET", server.URL+path, "")
-		if status != 200 || body != "OK\n" {
+		if status != http.StatusOK || body != "OK\n" {
 			t.Fatalf("%s: %d %s", path, status, body)
 		}
 	}
-	status, _, body := request(t, server.Client(), "POST", server.URL+"/api/run_sse", runBody)
-	if status != 404 {
-		t.Fatalf("missing session: %d %s", status, body)
+
+	// 1. Table-driven SSE route tests with distinct sessions for independent scenarios
+	type sseRouteTest struct {
+		name       string
+		sessionID  string
+		message    string
+		wantStatus int
+		wantHeader string
+		wantTexts  []string
+		checkState string
 	}
-	status, _, body = request(t, server.Client(), "POST", server.URL+sessionPath, "{}")
-	if status != 200 {
-		t.Fatalf("create session: %d %s", status, body)
+
+	routes := []sseRouteTest{
+		{
+			name:       "refund route opens new case",
+			sessionID:  "session-refund",
+			message:    "txn-2026-07-118845 A-114",
+			wantStatus: http.StatusOK,
+			wantHeader: "text/event-stream",
+			wantTexts:  []string{"data:", "refund:last_case_id", "rc-txn-2026-07-118845-A-114", "pending"},
+			checkState: "rc-txn-2026-07-118845-A-114",
+		},
+		{
+			name:       "refund route duplicate case returns already_open",
+			sessionID:  "session-refund",
+			message:    "txn-2026-07-118845 A-114",
+			wantStatus: http.StatusOK,
+			wantHeader: "text/event-stream",
+			wantTexts:  []string{"data:", "refund:last_case_id", "rc-txn-2026-07-118845-A-114", "already_open"},
+			checkState: "rc-txn-2026-07-118845-A-114",
+		},
+		{
+			name:       "status route checks existing case from registry in distinct session",
+			sessionID:  "session-status",
+			message:    "перевір статус rc-txn-2026-07-118845-A-114",
+			wantStatus: http.StatusOK,
+			wantHeader: "text/event-stream",
+			wantTexts:  []string{"data:", "rc-txn-2026-07-118845-A-114", "уже в реєстрі", "pending"},
+		},
+		{
+			name:       "out of domain route refuses irrelevant message in distinct session",
+			sessionID:  "session-ood",
+			message:    "привіт, яка сьогодні погода?",
+			wantStatus: http.StatusOK,
+			wantHeader: "text/event-stream",
+			wantTexts:  []string{"data:", "поза цим доменом"},
+		},
 	}
-	for _, want := range []string{"pending", "already_open"} {
-		status, headers, body := request(t, server.Client(), "POST", server.URL+"/api/run_sse", runBody)
-		if status != 200 || !strings.HasPrefix(headers.Get("Content-Type"), "text/event-stream") {
-			t.Fatalf("SSE: %d %v %s", status, headers, body)
-		}
-		for _, text := range []string{"data:", "refund:last_case_id", "rc-txn-2026-07-118845-A-114", want} {
-			if !strings.Contains(body, text) {
-				t.Fatalf("missing %q in SSE: %s", text, body)
+
+	createdSessions := make(map[string]bool)
+	for _, tc := range routes {
+		t.Run(tc.name, func(t *testing.T) {
+			if !createdSessions[tc.sessionID] {
+				createSession(t, server.Client(), server.URL, "first_graph_agent", "learner", tc.sessionID)
+				createdSessions[tc.sessionID] = true
+			}
+			body := makeRunBody("first_graph_agent", "learner", tc.sessionID, tc.message)
+			status, headers, respBody := request(t, server.Client(), "POST", server.URL+"/api/run_sse", body)
+			if status != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body = %s", status, tc.wantStatus, respBody)
+			}
+			if ct := headers.Get("Content-Type"); !strings.HasPrefix(ct, tc.wantHeader) {
+				t.Fatalf("Content-Type = %q, want prefix %q", ct, tc.wantHeader)
+			}
+			for _, text := range tc.wantTexts {
+				if !strings.Contains(respBody, text) {
+					t.Fatalf("missing %q in SSE response: %s", text, respBody)
+				}
+			}
+			if tc.checkState != "" {
+				sessPath := fmt.Sprintf("/api/apps/first_graph_agent/users/learner/sessions/%s", tc.sessionID)
+				sStatus, _, sBody := request(t, server.Client(), "GET", server.URL+sessPath, "")
+				if sStatus != http.StatusOK || !strings.Contains(sBody, tc.checkState) {
+					t.Fatalf("persisted session state %s = %d %s, want %q", sessPath, sStatus, sBody, tc.checkState)
+				}
+			}
+		})
+	}
+
+	// 2. Table-driven negative test scenarios
+	negativeCases := []struct {
+		name       string
+		body       string
+		wantStatus int
+		wantText   string
+	}{
+		{
+			name:       "missing session returns 404",
+			body:       makeRunBody("first_graph_agent", "learner", "nonexistent-session", "txn-2026-07-118845 A-114"),
+			wantStatus: http.StatusNotFound,
+			wantText:   "failed to find",
+		},
+		{
+			name:       "unknown appName returns 404",
+			body:       makeRunBody("missing_agent", "learner", "session-refund", "txn-2026-07-118845 A-114"),
+			wantStatus: http.StatusNotFound,
+			wantText:   "failed to find",
+		},
+		{
+			name:       "invalid JSON returns 400",
+			body:       `{"appName": "first_graph_agent", invalid`,
+			wantStatus: http.StatusBadRequest,
+			wantText:   "failed to decode",
+		},
+		{
+			name:       "node error after SSE starts returns event error",
+			body:       makeRunBody("first_graph_agent", "learner", "session-refund", "txn-2026-07-118845 Z-999"),
+			wantStatus: http.StatusOK,
+			wantText:   "event: error",
+		},
+	}
+
+	for _, tc := range negativeCases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, _, respBody := request(t, server.Client(), "POST", server.URL+"/api/run_sse", tc.body)
+			if status != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body = %s", status, tc.wantStatus, respBody)
+			}
+			if !strings.Contains(respBody, tc.wantText) {
+				t.Fatalf("missing %q in response: %s", tc.wantText, respBody)
+			}
+		})
+	}
+
+	// 3. Draining and liveness checks
+	t.Run("draining rejects new requests while health stays ok", func(t *testing.T) {
+		svc.draining.Store(true)
+		for _, path := range []string{"/readyz", "/api/run_sse"} {
+			status, _, body := request(t, server.Client(), "POST", server.URL+path, makeRunBody("first_graph_agent", "learner", "session-refund", "test"))
+			if status != http.StatusServiceUnavailable {
+				t.Fatalf("drain %s: %d %s", path, status, body)
 			}
 		}
-	}
-	status, _, body = request(t, server.Client(), "GET", server.URL+sessionPath, "")
-	if status != 200 || !strings.Contains(body, "refund:last_case_id") {
-		t.Fatalf("persisted session state: %d %s", status, body)
-	}
-	for _, tc := range []struct {
-		body string
-		code int
-		want string
-	}{
-		{`{`, 400, "failed to decode"},
-		{strings.ReplaceAll(runBody, "A-114", "Z-999"), 200, "event: error"},
-		{strings.ReplaceAll(runBody, "first_graph_agent", "missing_agent"), 404, "failed to find"},
-	} {
-		status, _, body := request(t, server.Client(), "POST", server.URL+"/api/run_sse", tc.body)
-		if status != tc.code || !strings.Contains(body, tc.want) {
-			t.Fatalf("negative request: %d %s", status, body)
+		status, _, body := request(t, server.Client(), "GET", server.URL+"/health", "")
+		if status != http.StatusOK || body != "OK\n" {
+			t.Fatalf("liveness during drain = %d %s", status, body)
 		}
-	}
-	svc.draining.Store(true)
-	for _, path := range []string{"/readyz", "/api/run_sse"} {
-		status, _, body := request(t, server.Client(), "POST", server.URL+path, runBody)
-		if status != 503 {
-			t.Fatalf("drain %s: %d %s", path, status, body)
-		}
-	}
-	status, _, _ = request(t, server.Client(), "GET", server.URL+"/health", "")
-	if status != 200 {
-		t.Fatalf("liveness during drain = %d", status)
-	}
+	})
 }

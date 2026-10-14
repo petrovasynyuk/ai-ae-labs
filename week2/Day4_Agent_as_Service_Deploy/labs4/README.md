@@ -23,8 +23,22 @@ curl -fsS -N "$BASE/api/run_sse" \
   -d '{"appName":"first_graph_agent","userId":"learner","sessionId":"demo","newMessage":{"role":"user","parts":[{"text":"Мерчант A-114 просить повернення по транзакції txn-2026-07-118845"}]}}'
 ```
 
-Контрольні точки: `OK` на обох probe-маршрутах; JSON із `"id":"demo"`; потім SSE `data:` з виходами трьох вузлів, `refund:last_case_id` і статусом `pending`.
+Контрольні точки: `OK` на обох probe-маршрутах; JSON із `"id":"demo"`; потім SSE `data:` з виходами чотирьох вузлів (`classify` → `prepare` → `open_refund_case` → `format`), `refund:last_case_id` і статусом `pending`.
 Повторіть лише SSE-запит: отримаєте `already_open`. `/api/run` також доступний через ADK як нестримінговий варіант.
+
+Для додаткових маршрутів Day 3 (статус наявного кейса та відмова):
+
+```bash
+# Читання статусу з реєстру:
+curl -fsS -N "$BASE/api/run_sse" \
+  -H 'Content-Type: application/json' \
+  -d '{"appName":"first_graph_agent","userId":"learner","sessionId":"demo","newMessage":{"role":"user","parts":[{"text":"перевір статус rc-txn-2026-07-118845-A-114"}]}}'
+
+# Запит поза доменом (відмова):
+curl -fsS -N "$BASE/api/run_sse" \
+  -H 'Content-Type: application/json' \
+  -d '{"appName":"first_graph_agent","userId":"learner","sessionId":"demo","newMessage":{"role":"user","parts":[{"text":"привіт, яка погода?"}]}}'
+```
 
 `appName` — **`first_graph_agent`**, незалежно від назви контейнера чи Cloud Run service.
 Це реальний `adkrest.NewServer`, не саморобний `/chat`. Поля запиту **camelCase**.
@@ -147,22 +161,118 @@ docker rm ai-ae-lab4
 
 Очікуємо `exit=0` і `ADK service drained and stopped`. Для короткого графа SIGTERM зазвичай приходить уже після відповіді; доказ активного drain дає `TestShutdown`, не цей idle-smoke.
 
-Виміряно 24.09.2026: `linux/amd64`, Docker image inspect `.Size` = **6 735 944 bytes**, UID/GID `65532:65532`. Це результат конкретної збірки, не гарантований розмір вашого образу.
-
-Перевірено ще раз 01.10.2026 тими самими задачами (`task week2:day4:docker:*`,
-Docker 29.4.0 / OrbStack, macOS arm64): `linux/amd64` — **6 751 693 bytes**
-(через емуляцію повільніше), `linux/arm64` — **6 137 830 bytes**.
-Обидві збірки дали `user=65532:65532`. Чотири перевірки пройшли в контейнері:
-`OK`, `OK`, JSON з `"id":"demo"`, три SSE-події з `"status":"pending"`; повторний
-SSE на тому ж контейнері — `"status":"already_open"`. `task week2:day4:docker:stop`
+Перевірено 14.10.2026 (Day 3 граф із класифікатором і валідацією схем): `linux/amd64`,
+Docker image inspect `.Size` = **23 970 543 bytes**, UID/GID `65532:65532`.
+Усі чотири перевірки пройшли в контейнері (`task week2:day4:docker:smoke`):
+`OK`, `OK`, JSON з `"id":"demo"`, чотири SSE-події з `"status":"pending"` (`classify` → `prepare` → `open_refund_case` → `format`);
+повторний SSE на тому ж контейнері — `"status":"already_open"`. `task week2:day4:docker:stop`
 дав `exit=0` і `ADK service drained and stopped`.
 
-`task week2:day4:docker:multiarch` перевірено того ж дня з локальним `registry:2`
-як `REGISTRY`: **36.9 s** на обидві архітектури (BuildKit-кеш уже теплий від
-збірок вище; на холодному кеші буде довше). Результат — індекс
-`application/vnd.oci.image.index.v1+json` рівно з двома маніфестами,
-`linux/amd64` і `linux/arm64`, без attestation-записів (`--provenance=false`).
-Локальна збірка знову дала `platform=linux/amd64 size=6751693 bytes user=65532:65532`.
+## Advanced: Стрес-тест паралельних SSE-запитів (k6)
+
+Сценарій навантаження збережено у [`loadtest/sse.js`](loadtest/sse.js). Кожна ітерація кожного віртуального користувача (VU) створює окрему унікальну сесію через `POST /api/apps/first_graph_agent/users/learner/sessions/{id}`, після чого надсилає `POST /api/run_sse` у детермінований граф без залучення реальної LLM (`stub/graph-only`).
+
+Вимірюється:
+- **TTFB до першої SSE-події** (`res.timings.waiting` — час до приходу заголовків SSE та першого chunk'а події `data:`);
+- **Повна тривалість SSE-потоку** (`res.timings.duration` — час до завершення всіх чотирьох подій графа та закриття стріму);
+- **Кількість успішних SSE-запитів** (HTTP 200, `text/event-stream`, події `data:`, статус `pending`/`already_open`);
+- **Помилки та відсоток відмов**.
+
+Команда запуску (за попередньо піднятого локального сервісу на `:8080`):
+
+```bash
+k6 run -e VUS=10 -e DURATION=10s week2/Day4_Agent_as_Service_Deploy/labs4/loadtest/sse.js
+```
+
+### Таблиця вимірювань (14.10.2026)
+
+Платформа: **linux/amd64** (Ubuntu, Go 1.27.1, k6 v1.8.2).
+Режим: **локальний детермінований граф (stub / without LLM)**, `http://127.0.0.1:8080`.
+
+| Concurrent Users (VUs) | Duration | Successful Requests (SSE) | Throughput (req/s) | TTFB p50 (med) | TTFB p95 | Full Duration p50 (med) | Full Duration p95 | Errors | Error Rate |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 VU | 10s | 4 844 | 484.35/s | 213 µs | 1.06 ms | 1.09 ms | 1.82 ms | 0 | 0.00% |
+| 10 VUs | 10s | 13 417 | 1 340.91/s | 1.03 ms | 3.78 ms | 3.30 ms | 16.42 ms | 0 | 0.00% |
+| 25 VUs | 10s | 11 246 | 1 121.58/s | 1.19 ms | 5.08 ms | 14.94 ms | 46.06 ms | 0 | 0.00% |
+| 50 VUs | 10s | 10 173 | 1 010.29/s | 1.06 ms | 5.39 ms | 43.27 ms | 83.18 ms | 0 | 0.00% |
+
+## Advanced: Локальне CPU та Heap профілювання (pprof)
+
+Для аналізу продуктивності під навантаженням сервіс підтримує opt-in прапорець `-pprof-addr`.
+
+**Безпека та ізоляція:**
+- За замовчуванням pprof **вимкнено** (`-pprof-addr=""`);
+- Приймається виключно loopback: `127.0.0.1:<port>` (будь-яка інша адреса, наприклад `0.0.0.0`, відхиляється валідацією при старті);
+- Ендпоінти `/debug/pprof/` монтуються на окремий ізольований listener і **ніколи не монтуються на основний сервісний порт** (запит `GET http://127.0.0.1:8080/debug/pprof/` повертає `404 Not Found`).
+
+### Команди зняття профілів
+
+```bash
+# 1. Запуск сервісу з окремим локальним pprof listener
+go run ./week2/Day4_Agent_as_Service_Deploy/labs4 -pprof-addr=127.0.0.1:6060
+
+# 2. В окремому терміналі — запуск stress-тесту k6
+k6 run -e VUS=25 -e DURATION=35s week2/Day4_Agent_as_Service_Deploy/labs4/loadtest/sse.js
+
+# 3. Зняття 30-секундного CPU-профілю під час навантаження
+go tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30
+
+# 4. Зняття heap-профілю пам'яті
+go tool pprof http://127.0.0.1:6060/debug/pprof/heap
+```
+
+### Висновки за профілями (знайдені вузькі місця)
+
+1. **Пам'ять (Heap Profile):**
+   - Найбільший споживач heap під навантаженням — `session.(*inMemoryService).AppendEvent` (**74.53 MB** flat, **114.04 MB (51.51%)** cum), а також клонування стану сесії `maps.clone` / `maps.Copy` (**38 MB** cum).
+   - **Вузьке місце:** Сервіс використовує `session.InMemoryService()`, де кожна сесія зберігає повний журнал подій без обмеження TTL та без фонового витіснення (eviction). За 45 000+ паралельних запитів це призводить до монотонного зростання пам'яті. Для production-розгортання потрібен перехід на зовнішнє (або durable) сховище сесій із налаштованим TTL та автоматичним очищенням неактивних сесій.
+
+2. **Процесор (CPU Profile):**
+   - Системні виклики `internal/runtime/syscall/linux.Syscall6` (запис чанків SSE через сокети) займають **13.10%** процесорного часу.
+   - Понад **40%** часу CPU припадає на підсистему Go GC та алокатора (`runtime.scanSpan`, `runtime.tryDeferToSpanScan`, `runtime.mallocgc`), що зумовлено високою частотою виділення короткоживучих об'єктів для кожної нової сесії та SSE-події.
+
+## Advanced: Порівняння runtime (scratch, distroless, alpine)
+
+У [`Dockerfile`](Dockerfile) реалізовано спільний етап збірки `build` (`golang:1.27.1`, `CGO_ENABLED=0`, `-trimpath -ldflags="-s -w"`), з якого той самий бінарник `/out/adk-service` копіюється у три різні цільові runtime (multi-stage targets):
+- `runtime-scratch` (`FROM scratch`)
+- `runtime-distroless` (`FROM gcr.io/distroless/static-debian12:nonroot`)
+- `runtime-alpine` (`FROM alpine:3.21`)
+
+Усі три образи запускаються від імені non-root UID/GID `65532:65532`.
+
+### Команди збірки та вимірювання
+
+```bash
+# 1. Збірка трьох цільових образів із спільного build stage
+docker build --platform linux/amd64 --target runtime-scratch -f week2/Day4_Agent_as_Service_Deploy/labs4/Dockerfile -t ai-ae-lab4:scratch .
+docker build --platform linux/amd64 --target runtime-distroless -f week2/Day4_Agent_as_Service_Deploy/labs4/Dockerfile -t ai-ae-lab4:distroless .
+docker build --platform linux/amd64 --target runtime-alpine -f week2/Day4_Agent_as_Service_Deploy/labs4/Dockerfile -t ai-ae-lab4:alpine .
+
+# 2. Вимірювання розміру образів
+docker image inspect ai-ae-lab4:scratch --format '{{.Size}} bytes'
+docker image inspect ai-ae-lab4:distroless --format '{{.Size}} bytes'
+docker image inspect ai-ae-lab4:alpine --format '{{.Size}} bytes'
+
+# 3. Вимірювання cold-start (час від запуску контейнера до першого 200 OK на /readyz)
+# docker run -d --rm -p 127.0.0.1:8085:8080 --read-only --cap-drop ALL <image>
+# і опитування curl до першого коду 200
+```
+
+### Таблиця порівняння (14.10.2026)
+
+Платформа: **linux/amd64** (Ubuntu, Go 1.27.1, Docker Engine).
+Методика cold start: запуск контейнера (`docker run --read-only --cap-drop ALL`) і вимірювання часу до першого успішного `HTTP 200 OK` на `/readyz` з кроком опитування 5 мс (медіана з 3 прогонів).
+
+| Runtime | Base Image / Digest | Platform | Image Size | Cold Start (до `/readyz`) | CA Bundle Requirement | User (UID/GID) | Shell / Package Manager |
+|---|---|---|---|---|---|---|---|
+| **scratch** | `scratch` | `linux/amd64` | **24 550 533 bytes** (~24.5 MB) | ~180 ms | **Обов'язковий** (`COPY --from=build`) | `65532:65532` | Відсутній (zero attack surface) |
+| **distroless** | `gcr.io/distroless/static-debian12:nonroot` (`sha256:afa5c8...`) | `linux/amd64` | **30 354 795 bytes** (~30.3 MB) | ~198 ms | **Вбудований** (входить до базового образу) | `65532:65532` | Відсутній (захищений runtime) |
+| **alpine** | `alpine:3.21` (`sha256:ce6475...`) | `linux/amd64` | **36 271 921 bytes** (~36.2 MB) | ~193 ms | **Вбудований** (пакет `ca-certificates`) | `65532:65532` | `sh`, `apk` (присутні в образі) |
+
+**Висновки:**
+1. **Cold start:** Усі три варіанти мають практично однаковий час холодного старту (180–200 мс), оскільки статичний Go-бінарник виконується безпосередньо ядрами Linux через `execve` без проміжних shell-ініціалізаторів.
+2. **Розмір:** `FROM scratch` дає мінімально можливий розмір (бінарник + 180 КБ CA bundle). Distroless додає ~5.8 МБ системних метаданих (tzdata, /etc/passwd тощо). Alpine додає ~11.7 МБ через BusyBox, libc та менеджер пакетів apk.
+3. **Безпека:** І `scratch`, і `distroless` не містять shell (`/bin/sh`) та package manager, що усуває можливість RCE-виконання довільних скриптів у контейнері.
 
 ## Опційно: GCP Cloud Run
 
