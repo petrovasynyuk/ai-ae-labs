@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -21,6 +22,45 @@ import (
 type service struct {
 	handler  http.Handler
 	draining atomic.Bool
+}
+
+func validatePprofAddr(addr string) error {
+	if addr == "" {
+		return nil
+	}
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid pprof address: %w", err)
+	}
+	if host != "127.0.0.1" {
+		return fmt.Errorf("pprof address must be strictly loopback (127.0.0.1:<port>), got %q", host)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 0 || port > 65535 {
+		return fmt.Errorf("invalid pprof port: %q", portStr)
+	}
+	return nil
+}
+
+func newPprofServer(addr string) (*http.Server, net.Listener, error) {
+	if err := validatePprofAddr(addr); err != nil {
+		return nil, nil, err
+	}
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("listen pprof: %w", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	server := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	return server, listener, nil
 }
 
 func listenAddress(port string) (string, error) {

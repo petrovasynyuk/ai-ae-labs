@@ -479,14 +479,14 @@ tasks:
         curl -sS -X POST "$BASE/api/apps/first_graph_agent/users/learner/sessions/demo" \
           -H 'Content-Type: application/json' -d '{}' | head -c 200; echo
         echo '--- 4/4 run the graph over SSE ---'
-        # Без `head -c`: потік завершується сам після трьох подій (~1.5 КБ), а
+        # Без `head -c`: потік завершується сам після чотирьох подій, а
         # обрізання через head дає `curl: (23) Failure writing output to
         # destination`, що виглядає як помилка, хоч нею не є.
         curl -fsS -N --max-time 30 "$BASE/api/run_sse" \
           -H 'Content-Type: application/json' \
           -d '{"appName":"first_graph_agent","userId":"learner","sessionId":"demo","newMessage":{"role":"user","parts":[{"text":"Мерчант A-114 просить повернення по транзакції txn-2026-07-118845"}]}}'
         echo
-        echo 'Очікувано: OK, OK, JSON з "id":"demo", потім три SSE data: з виходами вузлів.'
+        echo 'Очікувано: OK, OK, JSON з "id":"demo", потім чотири SSE data: з виходами вузлів (classify → prepare → open_refund_case → format).'
         echo 'Повторіть лише останній curl — отримаєте "status":"already_open".'
 
   # Доказ, що образ не просто стартує, а й коректно завершується: SIGTERM
